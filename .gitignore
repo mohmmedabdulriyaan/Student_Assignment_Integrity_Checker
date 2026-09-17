@@ -1,0 +1,18 @@
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+
+# Backend
+backend/venv/
+backend/__pycache__/
+backend/*.pyc
+backend/integritycheck.db
+backend/uploads/
+backend/.env
+
+# General
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
