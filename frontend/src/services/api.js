@@ -1,9 +1,9 @@
-const API_BASE_URL =
-  "http://127.0.0.1:8000";
+const API_BASE_URL = (
+  import.meta.env.VITE_API_BASE_URL ||
+  "https://student-assignment-integrity-checker-api.onrender.com"
+).replace(/\/+$/, "");
 
-export async function createSubmission(
-  formData
-) {
+export async function createSubmission(formData) {
   const response = await fetch(
     `${API_BASE_URL}/api/submissions`,
     {
@@ -13,13 +13,21 @@ export async function createSubmission(
   );
 
   if (!response.ok) {
-    const errorData =
-      await response.json();
+    let errorMessage =
+      "Failed to create submission.";
 
-    throw new Error(
-      errorData.detail ||
-        "Failed to create submission."
-    );
+    try {
+      const errorData =
+        await response.json();
+
+      errorMessage =
+        errorData.detail ||
+        errorMessage;
+    } catch {
+      // Keep default message.
+    }
+
+    throw new Error(errorMessage);
   }
 
   return response.json();
@@ -43,8 +51,7 @@ export async function verifySubmission(
   submissionId,
   file
 ) {
-  const formData =
-    new FormData();
+  const formData = new FormData();
 
   formData.append(
     "file",
