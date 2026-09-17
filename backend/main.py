@@ -31,12 +31,21 @@ app = FastAPI(
 # CORS
 # --------------------------------------------------
 
+ALLOWED_ORIGINS = [
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "https://student-assignment-integrity-checke.vercel.app",
+]
+
+VERCEL_ORIGIN_REGEX = (
+    r"^https://student-assignment-integrity-check"
+    r"(?:e|er)(?:-[a-z0-9-]+)*\.vercel\.app$"
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_origin_regex=VERCEL_ORIGIN_REGEX,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -775,10 +784,6 @@ def get_submission_file(
     upload_directory = (
         UPLOAD_DIR.resolve()
     )
-
-    # Security check:
-    # only files inside backend/uploads
-    # can be served.
 
     try:
         file_path.relative_to(
