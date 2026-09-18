@@ -1,11 +1,13 @@
-from pathlib import Path
-from datetime import datetime
+from pathlib import Path, PurePosixPath
+from datetime import datetime, timezone
+from urllib.parse import quote
+from io import BytesIO
 import mimetypes
-import shutil
-import sqlite3
+import os
 import uuid
 import zlib
 
+from dotenv import load_dotenv
 from fastapi import (
     FastAPI,
     File,
@@ -14,7 +16,11 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
+from supabase import Client, create_client
+
+
+load_dotenv()
 
 
 app = FastAPI(
@@ -23,7 +29,7 @@ app = FastAPI(
         "Backend API for Student Assignment "
         "Submission Integrity Checker"
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
 
@@ -38,8 +44,8 @@ ALLOWED_ORIGINS = [
 ]
 
 VERCEL_ORIGIN_REGEX = (
-    r"^https://student-assignment-integrity-check"
-    r"(?:e|er)(?:-[a-z0-9-]+)*\.vercel\.app$"
+    r"^https://student-assignment-integrity-checker"
+    r"(?:-[a-z0-9-]+)?\.vercel\.app$"
 )
 
 app.add_middleware(
@@ -53,22 +59,49 @@ app.add_middleware(
 
 
 # --------------------------------------------------
-# DIRECTORIES
+# SUPABASE CONFIGURATION
 # --------------------------------------------------
 
-BASE_DIR = Path(__file__).resolve().parent
+SUPABASE_URL = os.getenv(
+    "SUPABASE_URL",
+    "",
+).strip()
 
-UPLOAD_DIR = BASE_DIR / "uploads"
+SUPABASE_SECRET_KEY = os.getenv(
+    "SUPABASE_SECRET_KEY",
+    "",
+).strip()
 
-DATABASE_PATH = (
-    BASE_DIR / "integritycheck.db"
+SUPABASE_BUCKET = os.getenv(
+    "SUPABASE_BUCKET",
+    "assignments",
+).strip()
+
+
+if not SUPABASE_URL:
+    raise RuntimeError(
+        "SUPABASE_URL environment variable is missing."
+    )
+
+if not SUPABASE_SECRET_KEY:
+    raise RuntimeError(
+        "SUPABASE_SECRET_KEY environment variable is missing."
+    )
+
+if not SUPABASE_BUCKET:
+    raise RuntimeError(
+        "SUPABASE_BUCKET environment variable is missing."
+    )
+
+
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SECRET_KEY,
 )
 
-UPLOAD_DIR.mkdir(exist_ok=True)
-
 
 # --------------------------------------------------
-# ALLOWED FILE TYPES
+# FILE SETTINGS
 # --------------------------------------------------
 
 ALLOWED_EXTENSIONS = {
@@ -83,235 +116,24 @@ ALLOWED_EXTENSIONS = {
     ".png",
 }
 
-
-# --------------------------------------------------
-# DATABASE CONNECTION
-# --------------------------------------------------
-
-def get_db_connection():
-    connection = sqlite3.connect(
-        DATABASE_PATH
-    )
-
-    connection.row_factory = (
-        sqlite3.Row
-    )
-
-    return connection
+MAX_FILE_SIZE = 50 * 1024 * 1024
 
 
 # --------------------------------------------------
-# CHECK DATABASE COLUMN
+# FILE VALIDATION
 # --------------------------------------------------
 
-def column_exists(
-    cursor,
-    table_name,
-    column_name,
+def validate_filename(
+    filename: str | None,
 ):
-    cursor.execute(
-        f"PRAGMA table_info({table_name})"
-    )
-
-    columns = cursor.fetchall()
-
-    return any(
-        column["name"] == column_name
-        for column in columns
-    )
-
-
-# --------------------------------------------------
-# CREATE / UPGRADE DATABASE TABLES
-# --------------------------------------------------
-
-def initialize_database():
-    connection = get_db_connection()
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS submissions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            submission_id TEXT UNIQUE NOT NULL,
-            student_name TEXT NOT NULL,
-            student_id TEXT,
-            subject TEXT,
-            assignment_title TEXT NOT NULL,
-            description TEXT,
-            original_filename TEXT NOT NULL,
-            stored_filename TEXT NOT NULL,
-            file_size INTEGER NOT NULL,
-            reference_crc TEXT NOT NULL,
-            submitted_at TEXT NOT NULL
-        )
-        """
-    )
-
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS verifications (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            verification_id TEXT UNIQUE NOT NULL,
-            submission_id TEXT NOT NULL,
-            uploaded_filename TEXT NOT NULL,
-            current_crc TEXT NOT NULL,
-            reference_crc TEXT NOT NULL,
-            status TEXT NOT NULL,
-            verified_at TEXT NOT NULL
-        )
-        """
-    )
-
-    # Safe migration for older databases.
-
-    if not column_exists(
-        cursor,
-        "submissions",
-        "student_id",
-    ):
-        cursor.execute(
-            """
-            ALTER TABLE submissions
-            ADD COLUMN student_id TEXT
-            """
-        )
-
-    if not column_exists(
-        cursor,
-        "submissions",
-        "subject",
-    ):
-        cursor.execute(
-            """
-            ALTER TABLE submissions
-            ADD COLUMN subject TEXT
-            """
-        )
-
-    if not column_exists(
-        cursor,
-        "submissions",
-        "description",
-    ):
-        cursor.execute(
-            """
-            ALTER TABLE submissions
-            ADD COLUMN description TEXT
-            """
-        )
-
-    connection.commit()
-    connection.close()
-
-
-initialize_database()
-
-
-# --------------------------------------------------
-# CRC-32 FROM FILE
-# --------------------------------------------------
-
-def calculate_crc32(
-    file_path: Path,
-):
-    crc_value = 0
-
-    with file_path.open("rb") as file:
-        while True:
-            chunk = file.read(8192)
-
-            if not chunk:
-                break
-
-            crc_value = zlib.crc32(
-                chunk,
-                crc_value,
-            )
-
-    crc_value = (
-        crc_value & 0xFFFFFFFF
-    )
-
-    return f"{crc_value:08X}"
-
-
-# --------------------------------------------------
-# GENERATE SUBMISSION ID
-# --------------------------------------------------
-
-def generate_submission_id():
-    connection = get_db_connection()
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT COUNT(*) AS total
-        FROM submissions
-        """
-    )
-
-    total = cursor.fetchone()[
-        "total"
-    ]
-
-    connection.close()
-
-    next_number = total + 1
-
-    return (
-        f"SUB-2026-{next_number:03d}"
-    )
-
-
-# --------------------------------------------------
-# GENERATE VERIFICATION ID
-# --------------------------------------------------
-
-def generate_verification_id():
-    connection = get_db_connection()
-
-    cursor = connection.cursor()
-
-    cursor.execute(
-        """
-        SELECT COUNT(*) AS total
-        FROM verifications
-        """
-    )
-
-    total = cursor.fetchone()[
-        "total"
-    ]
-
-    connection.close()
-
-    next_number = total + 1
-
-    return (
-        f"VER-2026-{next_number:03d}"
-    )
-
-
-# --------------------------------------------------
-# SAVE UPLOADED FILE
-# --------------------------------------------------
-
-async def save_uploaded_file(
-    file: UploadFile,
-):
-    if not file.filename:
+    if not filename:
         raise HTTPException(
             status_code=400,
-            detail=(
-                "No filename was provided."
-            ),
+            detail="No filename was provided.",
         )
 
     original_filename = Path(
-        file.filename
+        filename
     ).name
 
     file_extension = Path(
@@ -324,71 +146,315 @@ async def save_uploaded_file(
     ):
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Unsupported file type."
-            ),
+            detail="Unsupported file type.",
         )
 
-    unique_filename = (
-        f"{uuid.uuid4().hex}_"
-        f"{original_filename}"
+    return (
+        original_filename,
+        file_extension,
     )
 
-    saved_file_path = (
-        UPLOAD_DIR / unique_filename
+
+# --------------------------------------------------
+# CRC-32
+# --------------------------------------------------
+
+def calculate_crc32_bytes(
+    file_bytes: bytes,
+):
+    crc_value = (
+        zlib.crc32(file_bytes)
+        & 0xFFFFFFFF
+    )
+
+    return f"{crc_value:08X}"
+
+
+# --------------------------------------------------
+# READ UPLOADED FILE
+# --------------------------------------------------
+
+async def read_uploaded_file(
+    file: UploadFile,
+):
+    (
+        original_filename,
+        file_extension,
+    ) = validate_filename(
+        file.filename
     )
 
     try:
-        with saved_file_path.open(
-            "wb"
-        ) as buffer:
-            shutil.copyfileobj(
-                file.file,
-                buffer,
-            )
+        file_bytes = await file.read()
 
-    except Exception:
-        if saved_file_path.exists():
-            saved_file_path.unlink()
-
+    except Exception as exc:
         raise HTTPException(
             status_code=500,
             detail=(
-                "Failed to save uploaded file."
+                "Failed to read uploaded file."
             ),
-        )
+        ) from exc
 
     finally:
         await file.close()
 
-    file_size = (
-        saved_file_path.stat().st_size
-    )
-
-    crc32_value = calculate_crc32(
-        saved_file_path
-    )
+    if len(file_bytes) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "File is too large. "
+                "Maximum allowed size is 50 MB."
+            ),
+        )
 
     return {
         "original_filename":
             original_filename,
 
-        "stored_filename":
-            unique_filename,
+        "file_extension":
+            file_extension,
 
         "file_size":
-            file_size,
+            len(file_bytes),
 
-        "file_path":
-            saved_file_path,
+        "file_bytes":
+            file_bytes,
 
         "crc32":
-            crc32_value,
+            calculate_crc32_bytes(
+                file_bytes
+            ),
     }
 
 
 # --------------------------------------------------
-# HOME ROUTE
+# SAVE ORIGINAL FILE TO SUPABASE STORAGE
+# --------------------------------------------------
+
+async def save_original_file(
+    file: UploadFile,
+):
+    uploaded = (
+        await read_uploaded_file(
+            file
+        )
+    )
+
+    storage_path = (
+        "submissions/"
+        f"{uuid.uuid4().hex}"
+        f"{uploaded['file_extension']}"
+    )
+
+    content_type = (
+        mimetypes.guess_type(
+            uploaded[
+                "original_filename"
+            ]
+        )[0]
+        or "application/octet-stream"
+    )
+
+    try:
+        supabase.storage.from_(
+            SUPABASE_BUCKET
+        ).upload(
+            path=storage_path,
+            file=BytesIO(
+                uploaded[
+                    "file_bytes"
+                ]
+            ),
+            file_options={
+                "content-type":
+                    content_type,
+
+                "upsert":
+                    "false",
+            },
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to store assignment file."
+            ),
+        ) from exc
+
+    uploaded["storage_path"] = (
+        storage_path
+    )
+
+    return uploaded
+
+
+# --------------------------------------------------
+# REMOVE STORAGE FILE
+# --------------------------------------------------
+
+def remove_stored_file(
+    storage_path: str,
+):
+    try:
+        supabase.storage.from_(
+            SUPABASE_BUCKET
+        ).remove(
+            [storage_path]
+        )
+
+    except Exception:
+        # Best-effort cleanup only.
+        pass
+
+
+# --------------------------------------------------
+# VALIDATE STORED FILE PATH
+# --------------------------------------------------
+
+def validate_storage_path(
+    storage_path: str,
+):
+    path = PurePosixPath(
+        storage_path
+    )
+
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or not path.parts
+        or path.parts[0]
+        != "submissions"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Invalid stored file path."
+            ),
+        )
+
+    return str(path)
+
+
+# --------------------------------------------------
+# GET ONE SUBMISSION
+# --------------------------------------------------
+
+def get_submission(
+    submission_id: str,
+):
+    try:
+        response = (
+            supabase.table(
+                "submissions"
+            )
+            .select("*")
+            .eq(
+                "submission_id",
+                submission_id,
+            )
+            .limit(1)
+            .execute()
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to access submission data."
+            ),
+        ) from exc
+
+    rows = response.data or []
+
+    if not rows:
+        return None
+
+    return rows[0]
+
+
+# --------------------------------------------------
+# GENERATE SUBMISSION ID
+# --------------------------------------------------
+
+def generate_submission_id():
+    try:
+        response = (
+            supabase.table(
+                "submissions"
+            )
+            .select("id")
+            .order(
+                "id",
+                desc=True,
+            )
+            .limit(1)
+            .execute()
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to generate submission ID."
+            ),
+        ) from exc
+
+    rows = response.data or []
+
+    next_number = (
+        int(rows[0]["id"]) + 1
+        if rows
+        else 1
+    )
+
+    return (
+        f"SUB-2026-{next_number:03d}"
+    )
+
+
+# --------------------------------------------------
+# GENERATE VERIFICATION ID
+# --------------------------------------------------
+
+def generate_verification_id():
+    try:
+        response = (
+            supabase.table(
+                "verifications"
+            )
+            .select("id")
+            .order(
+                "id",
+                desc=True,
+            )
+            .limit(1)
+            .execute()
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to generate verification ID."
+            ),
+        ) from exc
+
+    rows = response.data or []
+
+    next_number = (
+        int(rows[0]["id"]) + 1
+        if rows
+        else 1
+    )
+
+    return (
+        f"VER-2026-{next_number:03d}"
+    )
+
+
+# --------------------------------------------------
+# HOME
 # --------------------------------------------------
 
 @app.get("/")
@@ -403,11 +469,30 @@ def home():
 
 
 # --------------------------------------------------
-# STATUS ROUTE
+# STATUS
 # --------------------------------------------------
 
 @app.get("/api/status")
 def get_status():
+    try:
+        (
+            supabase.table(
+                "submissions"
+            )
+            .select("id")
+            .limit(1)
+            .execute()
+        )
+
+        database_status = (
+            "Supabase PostgreSQL active"
+        )
+
+    except Exception:
+        database_status = (
+            "Supabase PostgreSQL unavailable"
+        )
+
     return {
         "status":
             "online",
@@ -419,7 +504,10 @@ def get_status():
             "FastAPI",
 
         "database":
-            "SQLite active",
+            database_status,
+
+        "storage":
+            "Supabase Storage active",
 
         "crc_engine":
             "CRC-32 active",
@@ -439,7 +527,7 @@ def get_status():
 
 
 # --------------------------------------------------
-# ORIGINAL SUBMISSION ROUTE
+# CREATE SUBMISSION
 # --------------------------------------------------
 
 @app.post("/api/submissions")
@@ -493,7 +581,7 @@ async def create_submission(
         )
 
     uploaded = (
-        await save_uploaded_file(
+        await save_original_file(
             file
         )
     )
@@ -503,84 +591,84 @@ async def create_submission(
     )
 
     submitted_at = (
-        datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        datetime.now(
+            timezone.utc
+        ).isoformat()
     )
 
-    connection = (
-        get_db_connection()
-    )
+    record = {
+        "submission_id":
+            submission_id,
 
-    cursor = (
-        connection.cursor()
-    )
+        "student_name":
+            student_name,
+
+        "student_id":
+            student_id,
+
+        "subject":
+            subject,
+
+        "assignment_title":
+            assignment_title,
+
+        "description":
+            description,
+
+        "original_filename":
+            uploaded[
+                "original_filename"
+            ],
+
+        "stored_filename":
+            uploaded[
+                "storage_path"
+            ],
+
+        "file_size":
+            uploaded[
+                "file_size"
+            ],
+
+        "reference_crc":
+            uploaded[
+                "crc32"
+            ],
+
+        "submitted_at":
+            submitted_at,
+    }
 
     try:
-        cursor.execute(
-            """
-            INSERT INTO submissions (
-                submission_id,
-                student_name,
-                student_id,
-                subject,
-                assignment_title,
-                description,
-                original_filename,
-                stored_filename,
-                file_size,
-                reference_crc,
-                submitted_at
+        response = (
+            supabase.table(
+                "submissions"
             )
-            VALUES (
-                ?, ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?
+            .insert(
+                record
             )
-            """,
-            (
-                submission_id,
-                student_name,
-                student_id,
-                subject,
-                assignment_title,
-                description,
-                uploaded[
-                    "original_filename"
-                ],
-                uploaded[
-                    "stored_filename"
-                ],
-                uploaded[
-                    "file_size"
-                ],
-                uploaded[
-                    "crc32"
-                ],
-                submitted_at,
-            ),
+            .execute()
         )
 
-        connection.commit()
+        if not response.data:
+            raise RuntimeError(
+                "Submission insert "
+                "returned no data."
+            )
 
-    except Exception:
-        connection.rollback()
-
-        if uploaded[
-            "file_path"
-        ].exists():
+    except Exception as exc:
+        remove_stored_file(
             uploaded[
-                "file_path"
-            ].unlink()
+                "storage_path"
+            ]
+        )
 
         raise HTTPException(
             status_code=500,
             detail=(
                 "Failed to save submission."
             ),
-        )
-
-    finally:
-        connection.close()
+        ) from exc
 
     return {
         "message":
@@ -633,35 +721,41 @@ async def create_submission(
 
 @app.get("/api/submissions")
 def list_submissions():
-    connection = (
-        get_db_connection()
-    )
+    try:
+        response = (
+            supabase.table(
+                "submissions"
+            )
+            .select(
+                (
+                    "submission_id,"
+                    "student_name,"
+                    "student_id,"
+                    "subject,"
+                    "assignment_title,"
+                    "description,"
+                    "original_filename,"
+                    "file_size,"
+                    "reference_crc,"
+                    "submitted_at"
+                )
+            )
+            .order(
+                "id",
+                desc=True,
+            )
+            .execute()
+        )
 
-    cursor = (
-        connection.cursor()
-    )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to load submissions."
+            ),
+        ) from exc
 
-    cursor.execute(
-        """
-        SELECT
-            submission_id,
-            student_name,
-            student_id,
-            subject,
-            assignment_title,
-            description,
-            original_filename,
-            file_size,
-            reference_crc,
-            submitted_at
-        FROM submissions
-        ORDER BY id DESC
-        """
-    )
-
-    rows = cursor.fetchall()
-
-    connection.close()
+    rows = response.data or []
 
     return [
         {
@@ -676,14 +770,14 @@ def list_submissions():
                 ],
 
             "student_id":
-                row[
+                row.get(
                     "student_id"
-                ] or "",
+                ) or "",
 
             "subject":
-                row[
+                row.get(
                     "subject"
-                ] or "",
+                ) or "",
 
             "assignment_title":
                 row[
@@ -691,9 +785,9 @@ def list_submissions():
                 ],
 
             "description":
-                row[
+                row.get(
                     "description"
-                ] or "",
+                ) or "",
 
             "filename":
                 row[
@@ -720,7 +814,7 @@ def list_submissions():
 
 
 # --------------------------------------------------
-# PREVIEW / DOWNLOAD STORED FILE
+# PREVIEW / DOWNLOAD FILE
 # --------------------------------------------------
 
 @app.get(
@@ -730,31 +824,9 @@ def get_submission_file(
     submission_id: str,
     download: bool = False,
 ):
-    connection = (
-        get_db_connection()
+    submission = get_submission(
+        submission_id
     )
-
-    cursor = (
-        connection.cursor()
-    )
-
-    cursor.execute(
-        """
-        SELECT
-            submission_id,
-            original_filename,
-            stored_filename
-        FROM submissions
-        WHERE submission_id = ?
-        """,
-        (submission_id,),
-    )
-
-    submission = (
-        cursor.fetchone()
-    )
-
-    connection.close()
 
     if submission is None:
         raise HTTPException(
@@ -764,11 +836,13 @@ def get_submission_file(
             ),
         )
 
-    stored_filename = Path(
-        submission[
-            "stored_filename"
-        ]
-    ).name
+    storage_path = (
+        validate_storage_path(
+            submission[
+                "stored_filename"
+            ]
+        )
+    )
 
     original_filename = Path(
         submission[
@@ -776,50 +850,30 @@ def get_submission_file(
         ]
     ).name
 
-    file_path = (
-        UPLOAD_DIR /
-        stored_filename
-    ).resolve()
-
-    upload_directory = (
-        UPLOAD_DIR.resolve()
-    )
-
     try:
-        file_path.relative_to(
-            upload_directory
+        file_bytes = (
+            supabase.storage.from_(
+                SUPABASE_BUCKET
+            ).download(
+                storage_path
+            )
         )
 
-    except ValueError:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Invalid stored file path."
-            ),
-        )
-
-    if (
-        not file_path.exists()
-        or not file_path.is_file()
-    ):
+    except Exception as exc:
         raise HTTPException(
             status_code=404,
             detail=(
                 "Stored assignment file "
                 "was not found."
             ),
-        )
+        ) from exc
 
-    media_type, _ = (
+    media_type = (
         mimetypes.guess_type(
             original_filename
-        )
+        )[0]
+        or "application/octet-stream"
     )
-
-    if not media_type:
-        media_type = (
-            "application/octet-stream"
-        )
 
     disposition_type = (
         "attachment"
@@ -827,18 +881,26 @@ def get_submission_file(
         else "inline"
     )
 
-    return FileResponse(
-        path=file_path,
+    encoded_filename = quote(
+        original_filename
+    )
+
+    return Response(
+        content=file_bytes,
         media_type=media_type,
-        filename=original_filename,
-        content_disposition_type=(
-            disposition_type
-        ),
+        headers={
+            "Content-Disposition":
+                (
+                    f"{disposition_type}; "
+                    f"filename*=UTF-8''"
+                    f"{encoded_filename}"
+                )
+        },
     )
 
 
 # --------------------------------------------------
-# REAL VERIFICATION ROUTE
+# VERIFY SUBMISSION
 # --------------------------------------------------
 
 @app.post(
@@ -848,28 +910,9 @@ async def verify_submission(
     submission_id: str,
     file: UploadFile = File(...),
 ):
-    connection = (
-        get_db_connection()
+    submission = get_submission(
+        submission_id
     )
-
-    cursor = (
-        connection.cursor()
-    )
-
-    cursor.execute(
-        """
-        SELECT *
-        FROM submissions
-        WHERE submission_id = ?
-        """,
-        (submission_id,),
-    )
-
-    submission = (
-        cursor.fetchone()
-    )
-
-    connection.close()
 
     if submission is None:
         raise HTTPException(
@@ -880,7 +923,7 @@ async def verify_submission(
         )
 
     uploaded = (
-        await save_uploaded_file(
+        await read_uploaded_file(
             file
         )
     )
@@ -897,61 +940,72 @@ async def verify_submission(
         ]
     )
 
-    if (
-        reference_crc
+    status = (
+        "Match"
+        if reference_crc
         == current_crc
-    ):
-        status = "Match"
-
-    else:
-        status = "Mismatch"
+        else "Mismatch"
+    )
 
     verification_id = (
         generate_verification_id()
     )
 
     verified_at = (
-        datetime.now().strftime(
-            "%Y-%m-%d %H:%M:%S"
-        )
+        datetime.now(
+            timezone.utc
+        ).isoformat()
     )
 
-    connection = (
-        get_db_connection()
-    )
-
-    cursor = (
-        connection.cursor()
-    )
-
-    cursor.execute(
-        """
-        INSERT INTO verifications (
+    record = {
+        "verification_id":
             verification_id,
+
+        "submission_id":
             submission_id,
-            uploaded_filename,
-            current_crc,
-            reference_crc,
-            status,
-            verified_at
-        )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            verification_id,
-            submission_id,
+
+        "uploaded_filename":
             uploaded[
                 "original_filename"
             ],
-            current_crc,
-            reference_crc,
-            status,
-            verified_at,
-        ),
-    )
 
-    connection.commit()
-    connection.close()
+        "current_crc":
+            current_crc,
+
+        "reference_crc":
+            reference_crc,
+
+        "status":
+            status,
+
+        "verified_at":
+            verified_at,
+    }
+
+    try:
+        response = (
+            supabase.table(
+                "verifications"
+            )
+            .insert(
+                record
+            )
+            .execute()
+        )
+
+        if not response.data:
+            raise RuntimeError(
+                "Verification insert "
+                "returned no data."
+            )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to save verification."
+            ),
+        ) from exc
 
     return {
         "message":
@@ -969,14 +1023,14 @@ async def verify_submission(
             ],
 
         "student_id":
-            submission[
+            submission.get(
                 "student_id"
-            ] or "",
+            ) or "",
 
         "subject":
-            submission[
+            submission.get(
                 "subject"
-            ] or "",
+            ) or "",
 
         "assignment_title":
             submission[
@@ -1003,32 +1057,39 @@ async def verify_submission(
 
 @app.get("/api/verifications")
 def list_verifications():
-    connection = (
-        get_db_connection()
-    )
+    try:
+        response = (
+            supabase.table(
+                "verifications"
+            )
+            .select(
+                (
+                    "verification_id,"
+                    "submission_id,"
+                    "uploaded_filename,"
+                    "current_crc,"
+                    "reference_crc,"
+                    "status,"
+                    "verified_at"
+                )
+            )
+            .order(
+                "id",
+                desc=True,
+            )
+            .execute()
+        )
 
-    cursor = (
-        connection.cursor()
-    )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Failed to load "
+                "verification history."
+            ),
+        ) from exc
 
-    cursor.execute(
-        """
-        SELECT
-            verification_id,
-            submission_id,
-            uploaded_filename,
-            current_crc,
-            reference_crc,
-            status,
-            verified_at
-        FROM verifications
-        ORDER BY id DESC
-        """
-    )
-
-    rows = cursor.fetchall()
-
-    connection.close()
+    rows = response.data or []
 
     return [
         {
